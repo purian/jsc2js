@@ -1,0 +1,72 @@
+name: Build v8dasm for V8 10.2.154.26
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl python3 ninja-build clang pkg-config build-essential lsb-release
+
+      - name: Setup depot_tools
+        run: |
+          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git ~/depot_tools
+          echo "$HOME/depot_tools" >> $GITHUB_PATH
+
+      - name: Fetch V8 source
+        run: |
+          cd ~
+          fetch v8
+          cd v8
+          git checkout refs/tags/10.2.154.26
+          gclient sync -D
+
+      - name: Apply patch
+        run: |
+          cp $GITHUB_WORKSPACE/v8_10.2.patch ~/v8/
+          cd ~/v8
+          git apply v8_10.2.patch
+
+      - name: Configure build
+        run: |
+          cd ~/v8
+          ./tools/dev/v8gen.py x64.release
+          cat > out.gn/x64.release/args.gn << 'ARGS'
+          dcheck_always_on = false
+          is_component_build = false
+          is_debug = false
+          target_cpu = "x64"
+          use_custom_libcxx = false
+          v8_monolithic = true
+          v8_use_external_startup_data = false
+          v8_static_library = true
+          v8_enable_disassembler = true
+          v8_enable_object_print = true
+          v8_enable_pointer_compression = false
+          ARGS
+
+      - name: Build V8 monolith
+        run: |
+          cd ~/v8
+          ninja -C out.gn/x64.release v8_monolith
+
+      - name: Build v8dasm
+        run: |
+          cp $GITHUB_WORKSPACE/v8dasm.cpp ~/v8/
+          cd ~/v8
+          clang++ v8dasm.cpp -g -std=c++17 -Iinclude -Lout.gn/x64.release/obj \
+            -lv8_libbase -lv8_libplatform -lv8_monolith -o v8dasm -ldl -pthread
+
+      - name: Upload v8dasm binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: v8dasm-10.2.154.26-linux
+          path: ~/v8/v8dasm
+          retention-days: 30
