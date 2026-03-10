@@ -231,7 +231,6 @@ static void PrintAllSFIs(SharedFunctionInfo sfi, std::set<Address>& visited) {
 
   if (!sfi.HasBytecodeArray()) return;
   BytecodeArray bytecodes = sfi.GetActiveBytecodeArray();
-  if (!bytecodes.HasConstantPool()) return;
   FixedArray constants = bytecodes.constant_pool();
   for (int i = 0; i < constants.length(); i++) {
     Object obj = constants.get(i);
