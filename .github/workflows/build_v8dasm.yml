@@ -32,7 +32,13 @@ jobs:
         run: |
           cp $GITHUB_WORKSPACE/v8_10.2.patch ~/v8/
           cd ~/v8
-          git apply v8_10.2.patch
+          # Try git apply first, fall back to patch with fuzz
+          git apply --verbose v8_10.2.patch || patch -p1 --fuzz=5 < v8_10.2.patch
+
+          # Verify key modifications are present
+          grep -q "GetActiveBytecodeArray" src/diagnostics/objects-printer.cc
+          grep -q "kSuccess" src/snapshot/code-serializer.cc
+          echo "Patch applied successfully"
 
       - name: Configure build
         run: |
