@@ -115,7 +115,7 @@ def patch_code_serializer(v8_dir):
     if '#include <iostream>' not in content:
         last_include = content.rfind('#include ')
         end_of_include_line = content.find('\n', last_include) + 1
-        includes = '#include <iostream>\n#include <set>\n#include <csignal>\n#include <csetjmp>\n#include "src/objects/shared-function-info-inl.h"\n'
+        includes = '#include <iostream>\n#include <vector>\n#include <set>\n#include <csignal>\n#include <csetjmp>\n#include "src/objects/shared-function-info-inl.h"\n'
         content = content[:end_of_include_line] + includes + content[end_of_include_line:]
         print("  [OK] Added includes")
 
@@ -154,89 +154,133 @@ def patch_code_serializer(v8_dir):
     idx = content.find(deserialize_sig)
     if idx >= 0:
         helper_func = '''
-// Crash recovery for SIGSEGV during disassembly
+// Crash recovery for SIGSEGV/SIGBUS during disassembly
 static thread_local jmp_buf crash_recovery_buf;
-static thread_local bool crash_handler_active = false;
+static thread_local volatile bool crash_handler_active = false;
 
 static void crash_signal_handler(int sig) {
   if (crash_handler_active) {
-    longjmp(crash_recovery_buf, 1);
+    crash_handler_active = false;
+    longjmp(crash_recovery_buf, sig);
   }
+  // Re-raise if not ours
+  signal(sig, SIG_DFL);
+  raise(sig);
 }
 
-// Recursive SFI printer with visited set and crash recovery
-static void PrintAllSFIs(SharedFunctionInfo sfi, std::set<Address>& visited) {
-  Address addr = sfi.ptr();
-  if (visited.count(addr)) return;
-  visited.insert(addr);
+// Iterative SFI printer with work queue and per-entry crash recovery
+static void PrintAllSFIs(SharedFunctionInfo root_sfi, std::set<Address>& visited) {
+  std::vector<Address> work_queue;
+  work_queue.push_back(root_sfi.ptr());
 
-  // Install signal handler for crash recovery
-  struct sigaction sa, old_sa;
+  struct sigaction sa, old_sa, old_bus;
   sa.sa_handler = crash_signal_handler;
   sigemptyset(&sa.sa_mask);
   sa.sa_flags = 0;
-  sigaction(SIGSEGV, &sa, &old_sa);
-  sigaction(SIGBUS, &sa, nullptr);
 
-  std::cout << "\\nStart SharedFunctionInfo\\n";
+  int sfi_count = 0;
+  int crash_count = 0;
 
-  // Try printing SFI metadata
-  crash_handler_active = true;
-  if (setjmp(crash_recovery_buf) == 0) {
-    sfi.SharedFunctionInfoPrint(std::cout);
-  } else {
-    std::cout << "\\n// [CRASH RECOVERED during SharedFunctionInfoPrint]\\n";
-  }
+  while (!work_queue.empty()) {
+    Address current_addr = work_queue.back();
+    work_queue.pop_back();
 
-  // Try printing BytecodeArray
-  if (sfi.HasBytecodeArray()) {
+    if (visited.count(current_addr)) continue;
+    visited.insert(current_addr);
+    sfi_count++;
+
+    sigaction(SIGSEGV, &sa, &old_sa);
+    sigaction(SIGBUS, &sa, &old_bus);
+
+    SharedFunctionInfo sfi = SharedFunctionInfo::cast(Object(current_addr));
+
+    std::cerr << "[SFI " << sfi_count << "] Processing 0x"
+              << std::hex << current_addr << std::dec
+              << " (queue: " << work_queue.size() << ")\\n";
+
+    std::cout << "\\nStart SharedFunctionInfo\\n";
+
+    // 1. Print SFI metadata with crash recovery
+    crash_handler_active = true;
     if (setjmp(crash_recovery_buf) == 0) {
-      BytecodeArray bytecodes = sfi.GetActiveBytecodeArray();
-      std::cout << "\\nStart BytecodeArray\\n";
-      bytecodes.Disassemble(std::cout);
-      std::cout << "\\nEnd BytecodeArray\\n";
+      sfi.SharedFunctionInfoPrint(std::cout);
+      crash_handler_active = false;
     } else {
-      std::cout << "\\n// [CRASH RECOVERED during BytecodeArray::Disassemble]\\n";
-      std::cout << "\\nEnd BytecodeArray\\n";
+      crash_count++;
+      std::cout << "\\n// [CRASH RECOVERED during SharedFunctionInfoPrint]\\n";
     }
-  }
 
-  crash_handler_active = false;
-  std::cout << "\\nEnd SharedFunctionInfo\\n";
-  std::cout << std::flush;
+    // 2. Check if has bytecode array (safely)
+    volatile bool has_bytecodes = false;
+    crash_handler_active = true;
+    if (setjmp(crash_recovery_buf) == 0) {
+      has_bytecodes = sfi.HasBytecodeArray();
+      crash_handler_active = false;
+    } else {
+      crash_count++;
+      std::cerr << "  CRASH checking HasBytecodeArray\\n";
+    }
 
-  // Restore old signal handler
-  sigaction(SIGSEGV, &old_sa, nullptr);
-
-  // Recurse into nested SFIs from constant pool
-  if (!sfi.HasBytecodeArray()) return;
-
-  crash_handler_active = true;
-  sigaction(SIGSEGV, &sa, &old_sa);
-
-  if (setjmp(crash_recovery_buf) == 0) {
-    BytecodeArray bytecodes = sfi.GetActiveBytecodeArray();
-    FixedArray constants = bytecodes.constant_pool();
-    for (int i = 0; i < constants.length(); i++) {
-      Object obj = constants.get(i);
-      if (obj.IsSharedFunctionInfo()) {
+    // 3. Print BytecodeArray with crash recovery
+    if (has_bytecodes) {
+      crash_handler_active = true;
+      if (setjmp(crash_recovery_buf) == 0) {
+        BytecodeArray bytecodes = sfi.GetActiveBytecodeArray();
+        bytecodes.Disassemble(std::cout);
         crash_handler_active = false;
-        sigaction(SIGSEGV, &old_sa, nullptr);
-        PrintAllSFIs(SharedFunctionInfo::cast(obj), visited);
-        sigaction(SIGSEGV, &sa, &old_sa);
+      } else {
+        crash_count++;
+        std::cout << "\\n// [CRASH RECOVERED during BytecodeArray::Disassemble]\\n";
+        std::cerr << "  CRASH during Disassemble\\n";
+      }
+    }
+
+    std::cout << "\\nEnd SharedFunctionInfo\\n" << std::flush;
+
+    // 4. Collect child SFIs from constant pool with PER-ENTRY crash recovery
+    if (has_bytecodes) {
+      // Get pool length safely
+      volatile int pool_length = 0;
+      crash_handler_active = true;
+      if (setjmp(crash_recovery_buf) == 0) {
+        BytecodeArray bc = sfi.GetActiveBytecodeArray();
+        FixedArray cp = bc.constant_pool();
+        pool_length = cp.length();
+        crash_handler_active = false;
+      } else {
+        crash_count++;
+        std::cerr << "  CRASH getting constant pool length\\n";
+      }
+
+      // Iterate each constant pool entry INDIVIDUALLY
+      for (volatile int i = 0; i < pool_length; i++) {
         crash_handler_active = true;
-        if (setjmp(crash_recovery_buf) != 0) {
-          std::cout << "// [CRASH RECOVERED during constant pool traversal]\\n";
-          break;
+        if (setjmp(crash_recovery_buf) == 0) {
+          BytecodeArray bc = sfi.GetActiveBytecodeArray();
+          FixedArray cp = bc.constant_pool();
+          Object obj = cp.get(i);
+          crash_handler_active = false;
+          if (obj.IsSharedFunctionInfo()) {
+            Address child_addr = SharedFunctionInfo::cast(obj).ptr();
+            if (!visited.count(child_addr)) {
+              work_queue.push_back(child_addr);
+            }
+          }
+        } else {
+          // Skip this entry, continue to next - DO NOT BREAK
+          crash_count++;
         }
       }
     }
-  } else {
-    std::cout << "// [CRASH RECOVERED during constant pool access]\\n";
+
+    sigaction(SIGSEGV, &old_sa, nullptr);
+    sigaction(SIGBUS, &old_bus, nullptr);
   }
 
-  crash_handler_active = false;
-  sigaction(SIGSEGV, &old_sa, nullptr);
+  std::cout << "\\n// Total functions printed: " << sfi_count << "\\n";
+  std::cout << "// Total crashes recovered: " << crash_count << "\\n";
+  std::cerr << "Done: " << sfi_count << " SFIs printed, "
+            << crash_count << " crashes recovered\\n";
 }
 
 '''
@@ -250,12 +294,11 @@ static void PrintAllSFIs(SharedFunctionInfo sfi, std::set<Address>& visited) {
         insert_code = '''{
     std::set<Address> visited;
     PrintAllSFIs(*result, visited);
-    std::cout << "\\n// Total functions printed: " << visited.size() << "\\n";
   }
 
   '''
         content = content[:idx] + insert_code + content[idx:]
-        print("  [OK] Added recursive SFI traversal call")
+        print("  [OK] Added iterative SFI traversal call")
     else:
         fallback_marker = 'return scope.CloseAndEscape(result);'
         idx = content.find(fallback_marker)
@@ -263,12 +306,11 @@ static void PrintAllSFIs(SharedFunctionInfo sfi, std::set<Address>& visited) {
             insert_code = '''{
     std::set<Address> visited;
     PrintAllSFIs(*result, visited);
-    std::cout << "\\n// Total functions printed: " << visited.size() << "\\n";
   }
 
   '''
             content = content[:idx] + insert_code + content[idx:]
-            print("  [OK] Added recursive SFI traversal call (fallback)")
+            print("  [OK] Added iterative SFI traversal call (fallback)")
         else:
             print("  [WARN] Could not find insertion point for SFI traversal")
 
