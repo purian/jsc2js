@@ -74,66 +74,8 @@ def patch_objects_printer(v8_dir):
 
 
 def patch_objects_cc(v8_dir):
-    """Patch objects.cc - minimal changes, no recursive SFI printing."""
-    filepath = os.path.join(v8_dir, 'src/objects/objects.cc')
-    with open(filepath, 'r') as f:
-        content = f.read()
-
-    # Only keep the ASM_WASM_DATA_TYPE, FixedArray, ObjectBoilerplate, FixedDoubleArray patches
-    # NO recursive SharedFunctionInfo printing here (moved to code-serializer.cc)
-
-    # 1. Add ASM_WASM_DATA_TYPE check before switch statement
-    switch_marker = '  switch (map(cage_base).instance_type()) {'
-    if switch_marker in content:
-        insert = '''  // Print array literal members
-  if (map(cage_base).instance_type() == ASM_WASM_DATA_TYPE) {
-    os << "<ArrayBoilerplateDescription> ";
-    ArrayBoilerplateDescription::cast(*this)
-        .constant_elements()
-        .HeapObjectShortPrint(os);
-    return;
-  }
-
-'''
-        content = content.replace(switch_marker, insert + switch_marker, 1)
-        print("  [OK] Added ASM_WASM_DATA_TYPE check")
-
-    # 2. Add FixedArray printing
-    fa_marker = '      os << "<FixedArray[" << FixedArray::cast(*this).length() << "]>";'
-    if fa_marker in content:
-        replacement = fa_marker + '''
-      os << "\\nStart FixedArray\\n";
-      FixedArray::cast(*this).FixedArrayPrint(os);
-      os << "\\nEnd FixedArray\\n";'''
-        content = content.replace(fa_marker, replacement, 1)
-        print("  [OK] Added FixedArray printing")
-
-    # 3. Add ObjectBoilerplateDescription printing
-    obd_pattern = '      os << "<ObjectBoilerplateDescription[" << FixedArray::cast(*this).length()\n         << "]>";'
-    if obd_pattern in content:
-        replacement = obd_pattern + '''
-      os << "\\nStart ObjectBoilerplateDescription\\n";
-      ObjectBoilerplateDescription::cast(*this)
-          .ObjectBoilerplateDescriptionPrint(os);
-      os << "\\nEnd ObjectBoilerplateDescription\\n";'''
-        content = content.replace(obd_pattern, replacement, 1)
-        print("  [OK] Added ObjectBoilerplateDescription printing")
-
-    # 4. Add FixedDoubleArray printing
-    fda_pattern = '      os << "<FixedDoubleArray[" << FixedDoubleArray::cast(*this).length()\n         << "]>";'
-    if fda_pattern in content:
-        replacement = fda_pattern + '''
-      os << "\\nStart FixedDoubleArray\\n";
-      FixedDoubleArray::cast(*this).FixedDoubleArrayPrint(os);
-      os << "\\nEnd FixedDoubleArray\\n";'''
-        content = content.replace(fda_pattern, replacement, 1)
-        print("  [OK] Added FixedDoubleArray printing")
-
-    # NOTE: No recursive SharedFunctionInfo printing here.
-    # Recursive traversal is handled in code-serializer.cc with a visited set.
-
-    with open(filepath, 'w') as f:
-        f.write(content)
+    """No changes to objects.cc - all recursive handling is in code-serializer.cc."""
+    print("  [SKIP] No objects.cc changes needed (recursive printing handled in code-serializer.cc)")
     return True
 
 
