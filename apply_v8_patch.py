@@ -127,14 +127,29 @@ def patch_objects_cc(v8_dir):
         print("  [OK] Added FixedDoubleArray printing")
 
     # 5. Add nested SharedFunctionInfo printing
-    sfi_marker = '        os << "<SharedFunctionInfo>";'
-    if sfi_marker in content:
-        replacement = sfi_marker + '''
-      os << "\\nStart SharedFunctionInfo\\n";
+    # The code has an if/else: if name exists, prints with name; else without.
+    # We need to add recursive printing AFTER both branches, before break;
+    # Look for the SHARED_FUNCTION_INFO_TYPE case block
+    sfi_case = 'case SHARED_FUNCTION_INFO_TYPE:'
+    if sfi_case in content:
+        # Find the break; that ends this case
+        case_idx = content.find(sfi_case)
+        # Find the closing brace of the if-else block after the case
+        # Pattern: ...} else { ... os << "<SharedFunctionInfo>"; } break;
+        # We need to insert before 'break;' in this case
+        break_search_start = case_idx
+        # Find the 'break;' that belongs to this case
+        # It's after the closing brace of the SharedFunctionInfo block
+        break_idx = content.find('      break;', break_search_start)
+        if break_idx > 0:
+            insert_code = '''      os << "\\nStart SharedFunctionInfo\\n";
       shared.SharedFunctionInfoPrint(os);
-      os << "\\nEnd SharedFunctionInfo\\n";'''
-        content = content.replace(sfi_marker, replacement, 1)
-        print("  [OK] Added nested SharedFunctionInfo printing")
+      os << "\\nEnd SharedFunctionInfo\\n";
+'''
+            content = content[:break_idx] + insert_code + content[break_idx:]
+            print("  [OK] Added nested SharedFunctionInfo printing (before break)")
+        else:
+            print("  [WARN] Could not find break; for SHARED_FUNCTION_INFO_TYPE case")
 
     with open(filepath, 'w') as f:
         f.write(content)
