@@ -217,25 +217,33 @@ def patch_code_serializer(v8_dir):
             print("  [OK] Bypassed SanityCheck (alt)")
 
     # 3. Add SFI printing after successful deserialization
-    # Look for the profile_deserialization timing output in Deserialize function
-    profile_marker = 'if (FLAG_profile_deserialization) {\n'
-    idx = content.find(profile_marker)
-    if idx < 0:
-        # Try alternative pattern
-        profile_marker = 'if (FLAG_profile_deserialization) {'
-        idx = content.find(profile_marker)
-
+    # Use FinalizeDeserialization as anchor - it's unique and comes right after result is ready
+    finalize_marker = 'FinalizeDeserialization(isolate, result, timer);'
+    idx = content.find(finalize_marker)
     if idx >= 0:
-        insert_code = '''  std::cout << "\\nStart SharedFunctionInfo\\n";
+        insert_code = '''std::cout << "\\nStart SharedFunctionInfo\\n";
   result->SharedFunctionInfoPrint(std::cout);
   std::cout << "\\nEnd SharedFunctionInfo\\n";
   std::cout << std::flush;
 
   '''
         content = content[:idx] + insert_code + content[idx:]
-        print("  [OK] Added SFI print after deserialization")
+        print("  [OK] Added SFI print before FinalizeDeserialization")
     else:
-        print("  [WARN] Could not find profile_deserialization marker")
+        # Fallback: look for "return scope.CloseAndEscape(result);"
+        fallback_marker = 'return scope.CloseAndEscape(result);'
+        idx = content.find(fallback_marker)
+        if idx >= 0:
+            insert_code = '''std::cout << "\\nStart SharedFunctionInfo\\n";
+  result->SharedFunctionInfoPrint(std::cout);
+  std::cout << "\\nEnd SharedFunctionInfo\\n";
+  std::cout << std::flush;
+
+  '''
+            content = content[:idx] + insert_code + content[idx:]
+            print("  [OK] Added SFI print before CloseAndEscape (fallback)")
+        else:
+            print("  [WARN] Could not find insertion point for SFI print")
 
     with open(filepath, 'w') as f:
         f.write(content)
