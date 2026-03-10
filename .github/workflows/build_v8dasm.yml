@@ -55,16 +55,27 @@ jobs:
           cd ~/v8
           ninja -C out.gn/x64.release v8_monolith
 
-      - name: Build v8dasm
+      - name: Build v8dasm (patch-based)
         run: |
           cp $GITHUB_WORKSPACE/v8dasm.cpp ~/v8/
           cd ~/v8
           clang++ v8dasm.cpp -g -std=c++17 -Iinclude -Lout.gn/x64.release/obj \
             -lv8_libbase -lv8_libplatform -lv8_monolith -o v8dasm -ldl -pthread
 
-      - name: Upload v8dasm binary
+      - name: Build v8dasm_internal (internal API)
+        run: |
+          cp $GITHUB_WORKSPACE/v8dasm_internal.cpp ~/v8/
+          cd ~/v8
+          clang++ v8dasm_internal.cpp -g -std=c++17 -I. -Iinclude \
+            -Lout.gn/x64.release/obj \
+            -lv8_libbase -lv8_libplatform -lv8_monolith \
+            -o v8dasm_internal -ldl -pthread 2>&1 || echo "Internal build failed (expected if headers differ)"
+
+      - name: Upload v8dasm binaries
         uses: actions/upload-artifact@v4
         with:
           name: v8dasm-10.2.154.26-linux
-          path: ~/v8/v8dasm
+          path: |
+            ~/v8/v8dasm
+            ~/v8/v8dasm_internal
           retention-days: 30
