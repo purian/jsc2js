@@ -74,18 +74,13 @@ def patch_objects_printer(v8_dir):
 
 
 def patch_objects_cc(v8_dir):
-    """Patch objects.cc to print detailed object info."""
+    """Patch objects.cc - minimal changes, no recursive SFI printing."""
     filepath = os.path.join(v8_dir, 'src/objects/objects.cc')
     with open(filepath, 'r') as f:
         content = f.read()
 
-    # 0. Add depth counter at the top of HeapObjectShortPrint function
-    short_print_sig = 'void HeapObject::HeapObjectShortPrint(std::ostream& os) {'
-    if short_print_sig in content:
-        depth_code = short_print_sig + '''
-  static thread_local int sfi_print_depth = 0;'''
-        content = content.replace(short_print_sig, depth_code, 1)
-        print("  [OK] Added depth counter to HeapObjectShortPrint")
+    # Only keep the ASM_WASM_DATA_TYPE, FixedArray, ObjectBoilerplate, FixedDoubleArray patches
+    # NO recursive SharedFunctionInfo printing here (moved to code-serializer.cc)
 
     # 1. Add ASM_WASM_DATA_TYPE check before switch statement
     switch_marker = '  switch (map(cage_base).instance_type()) {'
@@ -134,34 +129,8 @@ def patch_objects_cc(v8_dir):
         content = content.replace(fda_pattern, replacement, 1)
         print("  [OK] Added FixedDoubleArray printing")
 
-    # 5. Add nested SharedFunctionInfo printing
-    # The code has an if/else: if name exists, prints with name; else without.
-    # We need to add recursive printing AFTER both branches, before break;
-    # Look for the SHARED_FUNCTION_INFO_TYPE case block
-    sfi_case = 'case SHARED_FUNCTION_INFO_TYPE:'
-    if sfi_case in content:
-        # Find the break; that ends this case
-        case_idx = content.find(sfi_case)
-        # Find the closing brace of the if-else block after the case
-        # Pattern: ...} else { ... os << "<SharedFunctionInfo>"; } break;
-        # We need to insert before 'break;' in this case
-        break_search_start = case_idx
-        # Find the 'break;' that belongs to this case
-        # It's after the closing brace of the SharedFunctionInfo block
-        break_idx = content.find('      break;', break_search_start)
-        if break_idx > 0:
-            insert_code = '''      if (sfi_print_depth < 200) {
-        sfi_print_depth++;
-        os << "\\nStart SharedFunctionInfo\\n";
-        shared.SharedFunctionInfoPrint(os);
-        os << "\\nEnd SharedFunctionInfo\\n";
-        sfi_print_depth--;
-      }
-'''
-            content = content[:break_idx] + insert_code + content[break_idx:]
-            print("  [OK] Added nested SharedFunctionInfo printing with depth limit")
-        else:
-            print("  [WARN] Could not find break; for SHARED_FUNCTION_INFO_TYPE case")
+    # NOTE: No recursive SharedFunctionInfo printing here.
+    # Recursive traversal is handled in code-serializer.cc with a visited set.
 
     with open(filepath, 'w') as f:
         f.write(content)
@@ -206,13 +175,13 @@ def patch_code_serializer(v8_dir):
     with open(filepath, 'r') as f:
         content = f.read()
 
-    # 1. Add iostream include
+    # 1. Add necessary includes
     if '#include <iostream>' not in content:
-        # Add after the last #include
         last_include = content.rfind('#include ')
         end_of_include_line = content.find('\n', last_include) + 1
-        content = content[:end_of_include_line] + '#include <iostream>\n' + content[end_of_include_line:]
-        print("  [OK] Added #include <iostream>")
+        includes = '#include <iostream>\n#include <set>\n#include "src/objects/shared-function-info-inl.h"\n'
+        content = content[:end_of_include_line] + includes + content[end_of_include_line:]
+        print("  [OK] Added includes (iostream, set, shared-function-info-inl.h)")
 
     # 2. Replace SanityCheck to always return success
     sanity_pattern = r'(SerializedCodeSanityCheckResult SerializedCodeData::SanityCheck\(\s*uint32_t expected_source_hash\) const \{)(.*?)(return SanityCheckJustSource\(expected_source_hash\);)'
@@ -243,34 +212,67 @@ def patch_code_serializer(v8_dir):
             content = content[:brace_start+1] + '\n  return SerializedCodeSanityCheckResult::kSuccess;\n' + content[pos-1:]
             print("  [OK] Bypassed SanityCheck (alt)")
 
-    # 3. Add SFI printing after successful deserialization
-    # Use FinalizeDeserialization as anchor - it's unique and comes right after result is ready
+    # 3. Add recursive SFI traversal function and call it after deserialization
+    # First, add the helper function before the Deserialize function
+    deserialize_sig = 'MaybeHandle<SharedFunctionInfo> CodeSerializer::Deserialize('
+    idx = content.find(deserialize_sig)
+    if idx >= 0:
+        helper_func = '''
+// Recursive SFI printer with visited set to avoid cycles
+static void PrintAllSFIs(SharedFunctionInfo sfi, std::set<Address>& visited) {
+  Address addr = sfi.ptr();
+  if (visited.count(addr)) return;
+  visited.insert(addr);
+
+  std::cout << "\\nStart SharedFunctionInfo\\n";
+  sfi.SharedFunctionInfoPrint(std::cout);
+  std::cout << "\\nEnd SharedFunctionInfo\\n";
+  std::cout << std::flush;
+
+  if (!sfi.HasBytecodeArray()) return;
+  BytecodeArray bytecodes = sfi.GetActiveBytecodeArray();
+  if (!bytecodes.HasConstantPool()) return;
+  FixedArray constants = bytecodes.constant_pool();
+  for (int i = 0; i < constants.length(); i++) {
+    Object obj = constants.get(i);
+    if (obj.IsSharedFunctionInfo()) {
+      PrintAllSFIs(SharedFunctionInfo::cast(obj), visited);
+    }
+  }
+}
+
+'''
+        content = content[:idx] + helper_func + content[idx:]
+        print("  [OK] Added PrintAllSFIs helper function")
+
+    # Now add the call after deserialization
     finalize_marker = 'FinalizeDeserialization(isolate, result, timer);'
     idx = content.find(finalize_marker)
     if idx >= 0:
-        insert_code = '''std::cout << "\\nStart SharedFunctionInfo\\n";
-  result->SharedFunctionInfoPrint(std::cout);
-  std::cout << "\\nEnd SharedFunctionInfo\\n";
-  std::cout << std::flush;
+        insert_code = '''{
+    std::set<Address> visited;
+    PrintAllSFIs(*result, visited);
+    std::cout << "\\n// Total functions printed: " << visited.size() << "\\n";
+  }
 
   '''
         content = content[:idx] + insert_code + content[idx:]
-        print("  [OK] Added SFI print before FinalizeDeserialization")
+        print("  [OK] Added recursive SFI traversal call")
     else:
-        # Fallback: look for "return scope.CloseAndEscape(result);"
         fallback_marker = 'return scope.CloseAndEscape(result);'
         idx = content.find(fallback_marker)
         if idx >= 0:
-            insert_code = '''std::cout << "\\nStart SharedFunctionInfo\\n";
-  result->SharedFunctionInfoPrint(std::cout);
-  std::cout << "\\nEnd SharedFunctionInfo\\n";
-  std::cout << std::flush;
+            insert_code = '''{
+    std::set<Address> visited;
+    PrintAllSFIs(*result, visited);
+    std::cout << "\\n// Total functions printed: " << visited.size() << "\\n";
+  }
 
   '''
             content = content[:idx] + insert_code + content[idx:]
-            print("  [OK] Added SFI print before CloseAndEscape (fallback)")
+            print("  [OK] Added recursive SFI traversal call (fallback)")
         else:
-            print("  [WARN] Could not find insertion point for SFI print")
+            print("  [WARN] Could not find insertion point for SFI traversal")
 
     with open(filepath, 'w') as f:
         f.write(content)
