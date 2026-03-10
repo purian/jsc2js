@@ -58,15 +58,9 @@ def patch_objects_printer(v8_dir):
         print("  [FAIL] Could not find os << newline before JSGlobalProxyPrint")
         return False
 
-    # Insert after os << "\n";
-    insert_point = content.find('\n', newline_idx) + 1
-    insert_code = '''  os << "\\nStart BytecodeArray\\n";
-  this->GetActiveBytecodeArray().Disassemble(os);
-  os << "\\nEnd BytecodeArray\\n";
-  os << std::flush;
-'''
-    content = content[:insert_point] + insert_code + content[insert_point:]
-    print("  [OK] Added BytecodeArray disassembly")
+    # Do NOT add BytecodeArray::Disassemble here - it crashes due to HeapObjectShortPrint
+    # BytecodeArray printing is handled separately in code-serializer.cc with crash recovery
+    print("  [SKIP] BytecodeArray disassembly handled in code-serializer.cc")
 
     with open(filepath, 'w') as f:
         f.write(content)
@@ -121,9 +115,9 @@ def patch_code_serializer(v8_dir):
     if '#include <iostream>' not in content:
         last_include = content.rfind('#include ')
         end_of_include_line = content.find('\n', last_include) + 1
-        includes = '#include <iostream>\n#include <set>\n#include "src/objects/shared-function-info-inl.h"\n'
+        includes = '#include <iostream>\n#include <set>\n#include <csignal>\n#include <csetjmp>\n#include "src/objects/shared-function-info-inl.h"\n'
         content = content[:end_of_include_line] + includes + content[end_of_include_line:]
-        print("  [OK] Added includes (iostream, set, shared-function-info-inl.h)")
+        print("  [OK] Added includes")
 
     # 2. Replace SanityCheck to always return success
     sanity_pattern = r'(SerializedCodeSanityCheckResult SerializedCodeData::SanityCheck\(\s*uint32_t expected_source_hash\) const \{)(.*?)(return SanityCheckJustSource\(expected_source_hash\);)'
@@ -160,26 +154,89 @@ def patch_code_serializer(v8_dir):
     idx = content.find(deserialize_sig)
     if idx >= 0:
         helper_func = '''
-// Recursive SFI printer with visited set to avoid cycles
+// Crash recovery for SIGSEGV during disassembly
+static thread_local jmp_buf crash_recovery_buf;
+static thread_local bool crash_handler_active = false;
+
+static void crash_signal_handler(int sig) {
+  if (crash_handler_active) {
+    longjmp(crash_recovery_buf, 1);
+  }
+}
+
+// Recursive SFI printer with visited set and crash recovery
 static void PrintAllSFIs(SharedFunctionInfo sfi, std::set<Address>& visited) {
   Address addr = sfi.ptr();
   if (visited.count(addr)) return;
   visited.insert(addr);
 
+  // Install signal handler for crash recovery
+  struct sigaction sa, old_sa;
+  sa.sa_handler = crash_signal_handler;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;
+  sigaction(SIGSEGV, &sa, &old_sa);
+  sigaction(SIGBUS, &sa, nullptr);
+
   std::cout << "\\nStart SharedFunctionInfo\\n";
-  sfi.SharedFunctionInfoPrint(std::cout);
+
+  // Try printing SFI metadata
+  crash_handler_active = true;
+  if (setjmp(crash_recovery_buf) == 0) {
+    sfi.SharedFunctionInfoPrint(std::cout);
+  } else {
+    std::cout << "\\n// [CRASH RECOVERED during SharedFunctionInfoPrint]\\n";
+  }
+
+  // Try printing BytecodeArray
+  if (sfi.HasBytecodeArray()) {
+    if (setjmp(crash_recovery_buf) == 0) {
+      BytecodeArray bytecodes = sfi.GetActiveBytecodeArray();
+      std::cout << "\\nStart BytecodeArray\\n";
+      bytecodes.Disassemble(std::cout);
+      std::cout << "\\nEnd BytecodeArray\\n";
+    } else {
+      std::cout << "\\n// [CRASH RECOVERED during BytecodeArray::Disassemble]\\n";
+      std::cout << "\\nEnd BytecodeArray\\n";
+    }
+  }
+
+  crash_handler_active = false;
   std::cout << "\\nEnd SharedFunctionInfo\\n";
   std::cout << std::flush;
 
+  // Restore old signal handler
+  sigaction(SIGSEGV, &old_sa, nullptr);
+
+  // Recurse into nested SFIs from constant pool
   if (!sfi.HasBytecodeArray()) return;
-  BytecodeArray bytecodes = sfi.GetActiveBytecodeArray();
-  FixedArray constants = bytecodes.constant_pool();
-  for (int i = 0; i < constants.length(); i++) {
-    Object obj = constants.get(i);
-    if (obj.IsSharedFunctionInfo()) {
-      PrintAllSFIs(SharedFunctionInfo::cast(obj), visited);
+
+  crash_handler_active = true;
+  sigaction(SIGSEGV, &sa, &old_sa);
+
+  if (setjmp(crash_recovery_buf) == 0) {
+    BytecodeArray bytecodes = sfi.GetActiveBytecodeArray();
+    FixedArray constants = bytecodes.constant_pool();
+    for (int i = 0; i < constants.length(); i++) {
+      Object obj = constants.get(i);
+      if (obj.IsSharedFunctionInfo()) {
+        crash_handler_active = false;
+        sigaction(SIGSEGV, &old_sa, nullptr);
+        PrintAllSFIs(SharedFunctionInfo::cast(obj), visited);
+        sigaction(SIGSEGV, &sa, &old_sa);
+        crash_handler_active = true;
+        if (setjmp(crash_recovery_buf) != 0) {
+          std::cout << "// [CRASH RECOVERED during constant pool traversal]\\n";
+          break;
+        }
+      }
     }
+  } else {
+    std::cout << "// [CRASH RECOVERED during constant pool access]\\n";
   }
+
+  crash_handler_active = false;
+  sigaction(SIGSEGV, &old_sa, nullptr);
 }
 
 '''
