@@ -79,6 +79,14 @@ def patch_objects_cc(v8_dir):
     with open(filepath, 'r') as f:
         content = f.read()
 
+    # 0. Add depth counter at the top of HeapObjectShortPrint function
+    short_print_sig = 'void HeapObject::HeapObjectShortPrint(std::ostream& os) {'
+    if short_print_sig in content:
+        depth_code = short_print_sig + '''
+  static thread_local int sfi_print_depth = 0;'''
+        content = content.replace(short_print_sig, depth_code, 1)
+        print("  [OK] Added depth counter to HeapObjectShortPrint")
+
     # 1. Add ASM_WASM_DATA_TYPE check before switch statement
     switch_marker = '  switch (map(cage_base).instance_type()) {'
     if switch_marker in content:
@@ -142,12 +150,16 @@ def patch_objects_cc(v8_dir):
         # It's after the closing brace of the SharedFunctionInfo block
         break_idx = content.find('      break;', break_search_start)
         if break_idx > 0:
-            insert_code = '''      os << "\\nStart SharedFunctionInfo\\n";
-      shared.SharedFunctionInfoPrint(os);
-      os << "\\nEnd SharedFunctionInfo\\n";
+            insert_code = '''      if (sfi_print_depth < 200) {
+        sfi_print_depth++;
+        os << "\\nStart SharedFunctionInfo\\n";
+        shared.SharedFunctionInfoPrint(os);
+        os << "\\nEnd SharedFunctionInfo\\n";
+        sfi_print_depth--;
+      }
 '''
             content = content[:break_idx] + insert_code + content[break_idx:]
-            print("  [OK] Added nested SharedFunctionInfo printing (before break)")
+            print("  [OK] Added nested SharedFunctionInfo printing with depth limit")
         else:
             print("  [WARN] Could not find break; for SHARED_FUNCTION_INFO_TYPE case")
 
